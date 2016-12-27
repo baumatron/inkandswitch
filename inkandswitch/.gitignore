@@ -1,5 +1,7 @@
 bin/
 obj/
 
-
+# Visual Studio user configuration
 *.suo
+*.user
+applicationhost.config
