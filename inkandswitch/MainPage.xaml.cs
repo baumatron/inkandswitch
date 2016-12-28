@@ -5,6 +5,8 @@ using Windows.UI.Input.Inking;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
 using System.Linq;
+using System.Collections;
+using Windows.UI;
 
 // The Blank Page item template is documented at http://go.microsoft.com/fwlink/?LinkId=402352&clcid=0x409
 
@@ -24,18 +26,21 @@ namespace inkandswitch
             ConfigureCanvasInput(this.LeftCanvas);
             ConfigureCanvasInput(this.RightCanvas);
 
-            LeftCanvas.InkPresenter.StrokesCollected += (sender, args) => ApplyStrokesToCanvas(RightCanvas, args);
-            RightCanvas.InkPresenter.StrokesCollected += (sender, args) => ApplyStrokesToCanvas(LeftCanvas, args);
+            var attributes = LeftCanvas.InkPresenter.CopyDefaultDrawingAttributes();
+            attributes.Color = Colors.Blue;
+            attributes.Size = new Windows.Foundation.Size(10, 5);
+            LeftCanvas.InkPresenter.UpdateDefaultDrawingAttributes(attributes);
+
+            attributes = RightCanvas.InkPresenter.CopyDefaultDrawingAttributes();
+            attributes.Color = Colors.Red;
+            RightCanvas.InkPresenter.UpdateDefaultDrawingAttributes(attributes);
+
+            leftCanvasContext = new CanvasContext(LeftCanvas);
+            leftCanvasContext.AddEventHandlers(RightCanvas);
+            rightCanvasContext = new CanvasContext(RightCanvas);
+            rightCanvasContext.AddEventHandlers(LeftCanvas);
         }
 
-        private void ApplyStrokesToCanvas(InkCanvas destinationCanvas, InkStrokesCollectedEventArgs args)
-        {
-            // Need to do a deep copy of the strokes, as one stroke can't exist in two separate canvases
-            foreach (var stroke in args.Strokes)
-            {
-                destinationCanvas.InkPresenter.StrokeContainer.AddStroke(stroke.Clone());
-            }
-        }
 
         private void ConfigureCanvasInput(InkCanvas canvas)
         {
@@ -71,23 +76,194 @@ namespace inkandswitch
             {
                 if (VirtualKey.Z == e.Key)
                 {
-                    Undo(LeftCanvas);
+                    leftCanvasContext.Undo();
+                }
+                else if (VirtualKey.Y == e.Key)
+                {
+                    leftCanvasContext.Redo();
                 }
             }
         }
 
-        private void Undo(InkCanvas canvas)
-        {
-            System.Diagnostics.Debug.WriteLine("Undo!");
+        private bool isCtrlPressed = false;
 
-            IReadOnlyList<InkStroke> strokes = canvas.InkPresenter.StrokeContainer.GetStrokes();
-            if (strokes.Count > 0)
+
+        class CanvasContext
+        {
+            public CanvasContext(InkCanvas canvas)
             {
-                strokes.Last().Selected = true;
-                canvas.InkPresenter.StrokeContainer.DeleteSelected();
+                this.canvas = canvas;
+
+                contextId = NextContextSequence();
+
+                canvas.InkPresenter.StrokesCollected += PushStrokeCommand;
             }
+
+            private void PushStrokeCommand(InkPresenter sender, InkStrokesCollectedEventArgs args)
+            {
+                undoStack.Push(new StrokeData(contextId, NextStrokeId(), args.Strokes));
+            }
+
+            public void AddEventHandlers(InkCanvas otherCanvas)
+            {
+                other = otherCanvas;
+
+                other.InkPresenter.StrokesCollected += ApplyOtherStrokesToCanvas;
+
+                other.InkPresenter.StrokeInput.StrokeStarted += OnOtherStrokeStarted;
+                other.InkPresenter.StrokeInput.StrokeContinued += OnOtherStrokeContinued;
+                other.InkPresenter.StrokeInput.StrokeEnded += OnOtherStrokeEnded;
+                other.InkPresenter.StrokeInput.StrokeCanceled += OnOtherStrokeCanceled;
+            }
+
+            private void ApplyOtherStrokesToCanvas(InkPresenter sender, InkStrokesCollectedEventArgs args)
+            {
+                // Need to do a deep copy of the strokes, as one stroke can't exist in two separate canvases
+                foreach (var stroke in args.Strokes)
+                {
+                    canvas.InkPresenter.StrokeContainer.AddStroke(stroke.Clone());
+                }
+
+                DiscardCurrentWetStroke();
+            }
+
+            private void OnOtherStrokeCanceled(InkStrokeInput sender, Windows.UI.Core.PointerEventArgs args)
+            {
+                DiscardCurrentWetStroke();
+            }
+
+            private void OnOtherStrokeEnded(InkStrokeInput sender, Windows.UI.Core.PointerEventArgs args)
+            {
+                ContinueStroke(args);
+            }
+
+            private void OnOtherStrokeContinued(InkStrokeInput sender, Windows.UI.Core.PointerEventArgs args)
+            {
+                ContinueStroke(args);
+            }
+
+            private void OnOtherStrokeStarted(InkStrokeInput sender, Windows.UI.Core.PointerEventArgs args)
+            {
+                inkPoints = new List<InkPoint>();
+                ContinueStroke(args);
+            }
+
+            private void ContinueStroke(Windows.UI.Core.PointerEventArgs args)
+            {
+                InkPoint point = new InkPoint(args.CurrentPoint.Position, args.CurrentPoint.Properties.Pressure);
+
+                inkPoints.Add(point);
+
+                var attributes = other.InkPresenter.CopyDefaultDrawingAttributes();
+                strokeBuilder.SetDefaultDrawingAttributes(attributes);
+                var newStroke = strokeBuilder.CreateStrokeFromInkPoints(inkPoints, System.Numerics.Matrix3x2.Identity);
+
+                ApplyStrokeToCanvas(canvas, newStroke);
+
+                DiscardCurrentWetStroke();
+
+                wetStroke = newStroke;
+            }
+
+            private void DiscardCurrentWetStroke()
+            {
+                if (null != wetStroke)
+                {
+                    wetStroke.Selected = true;
+                    canvas.InkPresenter.StrokeContainer.DeleteSelected();
+                    wetStroke = null;
+                }
+            }
+
+            private void ApplyStrokeToCanvas(InkCanvas destinationCanvas, InkStroke stroke)
+            {
+                destinationCanvas.InkPresenter.StrokeContainer.AddStroke(stroke);
+            }
+
+            public void Undo()
+            {
+                System.Diagnostics.Debug.WriteLine("Undo!");
+
+                if (undoStack.Count > 0)
+                {
+                    StrokeData data = undoStack.Pop();
+                    redoStack.Push(data.Clone());
+                    data.Select();
+                    canvas.InkPresenter.StrokeContainer.DeleteSelected();
+                }
+            }
+
+            public void Redo()
+            {
+                System.Diagnostics.Debug.WriteLine("Redo!");
+
+                if (redoStack.Count > 0)
+                {
+                    StrokeData data = redoStack.Pop();
+                    foreach (InkStroke stroke in data.Strokes)
+                    {
+                        ApplyStrokeToCanvas(canvas, stroke);
+                    }
+                    undoStack.Push(data);
+                }
+            }
+
+            private int NextStrokeId()
+            {
+                return ++strokeSequence;
+            }
+
+            static private int NextContextSequence()
+            {
+                return ++s_contextSequence;
+            }
+
+            private InkCanvas canvas;
+            private InkCanvas other;
+            private List<InkPoint> inkPoints = null;
+            private InkStroke wetStroke = null;
+            private InkStrokeBuilder strokeBuilder = new InkStrokeBuilder();
+            
+            class StrokeData
+            {
+                public StrokeData(int contextId, int id, IReadOnlyList<InkStroke> strokes)
+                {
+                    this.contextId = contextId;
+                    this.id = id;
+                    this.strokes = strokes;
+                }
+
+                public StrokeData Clone()
+                {
+                    return new StrokeData(contextId, id, strokes.Select(i => i.Clone()).ToList());
+                }
+
+                public void Select()
+                {
+                    foreach (var stroke in strokes)
+                    {
+                        stroke.Selected = true;
+                    }
+                }
+
+                public int ContextId { get { return contextId; } }
+                public int Id { get { return id; } }
+                public IReadOnlyList<InkStroke> Strokes { get { return strokes; } }
+
+                private int contextId;
+                private int id;
+                private IReadOnlyList<InkStroke> strokes;
+            }
+
+            private Stack<StrokeData> undoStack = new Stack<StrokeData>();
+            private Stack<StrokeData> redoStack = new Stack<StrokeData>();
+            private int strokeSequence = 0;
+            private int contextId;
+
+            private static int s_contextSequence = 0;
         }
 
-        private bool isCtrlPressed = false;
+        private CanvasContext leftCanvasContext;
+        private CanvasContext rightCanvasContext;
     }
 }
